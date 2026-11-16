@@ -24,6 +24,7 @@ static class Native
     [DllImport("user32.dll")] public static extern void keybd_event(byte vk, byte scan, uint flags, UIntPtr extra);
     [DllImport("user32.dll")] public static extern short GetAsyncKeyState(int vk);
     [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
+    [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr hwnd);
     [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr hwnd, IntPtr processId);
     [DllImport("user32.dll")] public static extern IntPtr GetKeyboardLayout(uint threadId);
     [DllImport("user32.dll")] public static extern bool PostMessage(IntPtr h, uint msg, IntPtr w, IntPtr l);
@@ -430,6 +431,8 @@ class App : Form
     string hotName = "Pause";
     bool dialogOpen;
     Icon icon;
+    IntPtr lastTargetWindow = IntPtr.Zero;
+    System.Windows.Forms.Timer foregroundTimer;
 
     [STAThread]
     static void Main(string[] a)
@@ -503,11 +506,23 @@ class App : Form
         tray = new NotifyIcon { Icon = icon, ContextMenuStrip = menu, Visible = true };
         tray.MouseClick += (s, e) =>
         {
-            if (e.Button == MouseButtons.Left) Fix();
+            if (e.Button == MouseButtons.Left)
+            {
+                if (lastTargetWindow != IntPtr.Zero) Native.SetForegroundWindow(lastTargetWindow);
+                Thread.Sleep(40);
+                Fix();
+            }
         };
 
         CreateHandle();                 // the form is never shown; hotkeys need a window handle
         Clip.Owner = Handle;
+        lastTargetWindow = Native.GetForegroundWindow();
+        foregroundTimer = new System.Windows.Forms.Timer { Interval = 200, Enabled = true };
+        foregroundTimer.Tick += (s, e) =>
+        {
+            IntPtr active = Native.GetForegroundWindow();
+            if (active != IntPtr.Zero && active != Handle) lastTargetWindow = active;
+        };
         ApplySettings();
 
         // lets a second launch of the exe open the settings of the running instance
@@ -645,8 +660,9 @@ class App : Form
         bool lineMode = false;
         if (string.IsNullOrEmpty(text))
         {
-            // nothing selected -> select from the line start to the cursor and copy that
-            Key(0x10, false); Key(0x24, false); Key(0x24, true); Key(0x10, true);
+            // Nothing selected: select the entire current draft, so a tray click
+            // converts it without requiring the user to highlight it first.
+            Combo(0x11, 0x41);
             text = CopySelection(300);
             lineMode = true;
         }
