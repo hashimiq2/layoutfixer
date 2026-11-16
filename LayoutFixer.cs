@@ -24,6 +24,8 @@ static class Native
     [DllImport("user32.dll")] public static extern void keybd_event(byte vk, byte scan, uint flags, UIntPtr extra);
     [DllImport("user32.dll")] public static extern short GetAsyncKeyState(int vk);
     [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
+    [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr hwnd, IntPtr processId);
+    [DllImport("user32.dll")] public static extern IntPtr GetKeyboardLayout(uint threadId);
     [DllImport("user32.dll")] public static extern bool PostMessage(IntPtr h, uint msg, IntPtr w, IntPtr l);
     [DllImport("user32.dll")] public static extern uint GetClipboardSequenceNumber();
     [DllImport("user32.dll")] public static extern bool OpenClipboard(IntPtr owner);
@@ -51,7 +53,7 @@ static class Clip
 
     static bool Open()
     {
-        for (int i = 0; i < 60; i++) { if (Native.OpenClipboard(Owner)) return true; Thread.Sleep(3); }
+        for (int i = 0; i < 20; i++) { if (Native.OpenClipboard(Owner)) return true; Thread.Sleep(3); }
         return false;
     }
 
@@ -145,11 +147,14 @@ class Conv
     public IntPtr A, B;
     Dictionary<string, string> aToB, bToA;
     HashSet<char> aOnly = new HashSet<char>(), bOnly = new HashSet<char>();
+    int maxKeyLength = 1;
 
     public Conv(IntPtr a, IntPtr b)
     {
         A = a; B = b;
         aToB = Build(a, b); bToA = Build(b, a);
+        foreach (string k in aToB.Keys) if (k.Length > maxKeyLength) maxKeyLength = k.Length;
+        foreach (string k in bToA.Keys) if (k.Length > maxKeyLength) maxKeyLength = k.Length;
         var aSet = new HashSet<char>(); var bSet = new HashSet<char>();
         foreach (var k in aToB.Keys) if (k.Length == 1) aSet.Add(k[0]);
         foreach (var k in bToA.Keys) if (k.Length == 1) bSet.Add(k[0]);
@@ -186,23 +191,29 @@ class Conv
         return d;
     }
 
-    // returns null if the text has nothing convertible; aToBDir tells the direction used
-    public string Convert(string s, out bool aToBDir)
+    // Score distinctive source characters first; use the active keyboard layout to
+    // resolve genuine ties (common for punctuation and very short strings).
+    public string Convert(string s, IntPtr activeLayout, out bool aToBDir)
     {
         int sa = 0, sb = 0;
         foreach (char c in s) { if (aOnly.Contains(c)) sa++; else if (bOnly.Contains(c)) sb++; }
-        aToBDir = sa >= sb;
-        if (sa == 0 && sb == 0) return null;
+        aToBDir = sa == sb ? (activeLayout == IntPtr.Zero || activeLayout == A) : sa > sb;
         var map = aToBDir ? aToB : bToA;
         var o = new StringBuilder();
         for (int i = 0; i < s.Length; i++)
         {
-            string r;
-            if (i + 1 < s.Length && map.TryGetValue(s.Substring(i, 2), out r)) { o.Append(r); i++; }
-            else if (map.TryGetValue(s.Substring(i, 1), out r)) o.Append(r);
+            string r = null; int used = 0;
+            for (int len = Math.Min(maxKeyLength, s.Length - i); len > 0; len--)
+                if (map.TryGetValue(s.Substring(i, len), out r)) { used = len; break; }
+            // Caps Lock can produce uppercase Latin text without Shift. Keyboard
+            // layouts do not generally have an uppercase Arabic layer, so retry
+            // the unshifted key before leaving these letters untouched.
+            if (used == 0 && char.IsUpper(s[i]) && map.TryGetValue(char.ToLowerInvariant(s[i]).ToString(), out r)) used = 1;
+            if (used > 0) { o.Append(r); i += used - 1; }
             else o.Append(s[i]);
         }
-        return o.ToString();
+        string converted = o.ToString();
+        return converted == s ? null : converted;
     }
 }
 
@@ -431,7 +442,7 @@ class App : Form
             IntPtr x, y; string hot; bool fr;
             Config.Load(items, out x, out y, out hot, out fr);
             var c = new Conv(x, y); bool dir;
-            Console.WriteLine(c.Convert(a[1], out dir) + "   [" + (dir ? "1->2" : "2->1") + "]");
+            Console.WriteLine(c.Convert(a[1], IntPtr.Zero, out dir) + "   [" + (dir ? "1->2" : "2->1") + "]");
             return;
         }
         Application.EnableVisualStyles();
@@ -490,7 +501,10 @@ class App : Form
         if (Setup.IsInstalledCopy()) menu.Items.Add("Uninstall...", null, (s, e) => { tray.Visible = false; Setup.Uninstall(true); tray.Visible = true; });
         menu.Items.Add("Exit", null, (s, e) => { tray.Visible = false; Application.Exit(); });
         tray = new NotifyIcon { Icon = icon, ContextMenuStrip = menu, Visible = true };
-        tray.DoubleClick += (s, e) => ShowSettings();
+        tray.MouseClick += (s, e) =>
+        {
+            if (e.Button == MouseButtons.Left) Fix();
+        };
 
         CreateHandle();                 // the form is never shown; hotkeys need a window handle
         Clip.Owner = Handle;
@@ -572,7 +586,7 @@ class App : Form
 
     static void WaitModifiersUp()
     {
-        for (int i = 0; i < 200; i++)
+        for (int i = 0; i < 40; i++)
         {
             if ((Native.GetAsyncKeyState(0x11) & 0x8000) == 0 && (Native.GetAsyncKeyState(0x12) & 0x8000) == 0 && (Native.GetAsyncKeyState(0x10) & 0x8000) == 0) return;
             Thread.Sleep(5);
@@ -594,7 +608,7 @@ class App : Form
     }
 
     // types the text directly (no clipboard involved) -> no dependence on the target app's paste timing
-    static void TypeText(string text)
+    static bool TypeText(string text)
     {
         var inp = new List<Native.INPUT>();
         Action<ushort, ushort, uint> add = (vk, sc, fl) =>
@@ -610,7 +624,7 @@ class App : Form
             else if (c == '\t') { add(0x09, 0, 0); add(0x09, 0, 2); }
             else { add(0, c, 4); add(0, c, 4 | 2); }
         }
-        Native.SendInput((uint)inp.Count, inp.ToArray(), Marshal.SizeOf(typeof(Native.INPUT)));
+        return Native.SendInput((uint)inp.Count, inp.ToArray(), Marshal.SizeOf(typeof(Native.INPUT))) == inp.Count;
     }
 
     // opt-in timing log (set env LF_DEBUG=1); never writes any user text
@@ -641,20 +655,24 @@ class App : Form
         if (string.IsNullOrEmpty(text)) return;
 
         bool aToB;
-        string fixedText = conv.Convert(text, out aToB);
+        IntPtr foreground = Native.GetForegroundWindow();
+        uint thread = Native.GetWindowThreadProcessId(foreground, IntPtr.Zero);
+        IntPtr activeLayout = Native.GetKeyboardLayout(thread);
+        string fixedText = conv.Convert(text, activeLayout, out aToB);
         if (fixedText == null || fixedText == text)
         {
             if (lineMode) { Key(0x27, false); Key(0x27, true); }   // collapse our selection (Right arrow)
             return;
         }
 
-        if (fixedText.Length <= 3000) TypeText(fixedText);
-        else
-        {
-            Clip.Set(fixedText); Thread.Sleep(20);
-            Combo(0x11, 0x56); Thread.Sleep(250);
-            if (saved != null) Clip.Set(saved);
-        }
+        // Electron editors (including Discord) may report Unicode SendInput as
+        // accepted while dropping VK_PACKET text. Clipboard paste is reliable there.
+        // The original selection is still active, so paste replaces it directly.
+        Clip.Set(fixedText);
+        Thread.Sleep(25);
+        Combo(0x11, 0x56);
+        Thread.Sleep(120);
+        if (saved != null) Clip.Set(saved);
 
         Dbg("typed " + fixedText.Length + " chars");
         // switch the keyboard layout to the language the text was meant for
